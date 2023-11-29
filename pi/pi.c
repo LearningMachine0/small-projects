@@ -11,6 +11,7 @@
 #include <omp.h>
 
 #define BITS_PER_DIGIT 3.32192809489
+omp_lock_t rw_M;
 
 static inline void L(mpz_t result, unsigned long q)
 {
@@ -33,30 +34,26 @@ static inline void X(mpz_t result, unsigned long q)
     return;
 }
 
-unsigned long M_last_iter;
-mpz_t M_last_num;
-mpz_t M_last_den;
-static inline void M(mpz_t result, unsigned long q)
+mpz_t last_M_num;
+mpz_t last_M_den;
+unsigned int last_M_q;
+void M(mpz_t rv, mpz_t n, mpz_t d, unsigned long q)
 {
-    // numerator product n=0 -> q-1: ((12n+6)^3 - (192n + 96))
-    // denominator product n=0 -> q-1: (n+1)^3
-    mpz_t a, b, c;
-    mpz_inits(a, b, c, NULL);
-    mpz_t prod_n, prod_d, prod;
-    mpz_inits(prod_n, prod_d, prod, NULL);
-    unsigned long last_iter;
-    #pragma omp critical
-    {
-        mpz_set(prod_n, M_last_num);
-        mpz_set(prod_d, M_last_den);
-        // Copy last iteration number to prevent race condition
-        last_iter = M_last_iter;
-    }
+    // ((12q + 6)^3 - (192q + 96))/(q+1)^3
+    mpz_t a, b, c, result, num, den;
+    mpz_inits(a, b, c, result, num, den, NULL);
+    unsigned int last_q;
+
+    omp_set_lock(&rw_M);
+    last_q = last_M_q;
+    mpz_set(num, last_M_num);
+    mpz_set(den, last_M_den);
+    omp_unset_lock(&rw_M);
 
     // Calculate M based on previous value of M
-    if (q > last_iter)
+    if (q > last_q)
     {
-        for (unsigned long n = last_iter; n < q; n++)
+        for (unsigned long n = last_q; n < q; n++)
         {
             mpz_set_ui(a, n);
             mpz_mul_ui(a, a, 12);
@@ -68,17 +65,17 @@ static inline void M(mpz_t result, unsigned long q)
             mpz_add_ui(b, b, 96);
 
             mpz_sub(a, a, b);
-            mpz_mul(prod_n, prod_n, a);
+            mpz_mul(num, num, a);
 
             mpz_set_ui(c, n);
             mpz_add_ui(c, c, 1);
             mpz_pow_ui(c, c, 3);
-            mpz_mul(prod_d, prod_d, c);
+            mpz_mul(den, den, c);
         }
     }
-    else if (q < last_iter)
+    else if (q < last_q)
     {
-        for (unsigned long n = last_iter - 1; n >= q; n--)
+        for (unsigned long n = last_q - 1; n >= q; n--)
         {
             mpz_set_ui(a, n);
             mpz_mul_ui(a, a, 12);
@@ -90,44 +87,33 @@ static inline void M(mpz_t result, unsigned long q)
             mpz_add_ui(b, b, 96);
 
             mpz_sub(a, a, b);
-            mpz_divexact(prod_n, prod_n, a);
-            
+            mpz_divexact(num, num, a);
+
             mpz_set_ui(c, n);
             mpz_add_ui(c, c, 1);
             mpz_pow_ui(c, c, 3);
-            mpz_divexact(prod_d, prod_d, c);
+            mpz_divexact(den, den, c);
         }
     }
-    else if (q == last_iter)
-    {
-        //#pragma omp critical
-        mpz_set(prod_n, M_last_num);
-        mpz_set(prod_d, M_last_den);
-    }
-    mpz_clears(a, b, c,  NULL);
-    mpz_set(prod, prod_n);
-    mpz_divexact(prod, prod, prod_d);
-    mpz_set(result, prod);
-    
-    // Prevent race condition when writing to global variable
-    #pragma omp critical
-    if (q % 5 == 0)
-    {
-        M_last_iter = q;
-        mpz_set(M_last_num, prod_n);
-        mpz_set(M_last_den, prod_d);
-    }
-    mpz_clears(prod, prod_n, prod_d, NULL);
+    mpz_divexact(result, num, den);
+
+    mpz_set(rv, result);
+    mpz_set(n, num);
+    mpz_set(d, den);
+    mpz_clears(a, b, c, result, num, den, NULL);
     return;
 }
 
 void pi(mpf_t result, unsigned long prec_bits, unsigned long prec_digits)
 {
     // intialisation for M function
-    mpz_inits(M_last_num, M_last_den, NULL);
-    M_last_iter = 0;
-    mpz_set_ui(M_last_num, 1);
-    mpz_set_ui(M_last_den, 1);
+    last_M_q = 0;
+    mpz_inits(last_M_num, last_M_den, NULL);
+    mpz_set_ui(last_M_num, 1);
+    mpz_set_ui(last_M_den, 1);
+    int M_change_interval = 10; // for last_M_* variables
+
+    // omp_init_lock(&rw_M);
 
     // constant
     mpf_t constant, final;
@@ -135,19 +121,22 @@ void pi(mpf_t result, unsigned long prec_bits, unsigned long prec_digits)
     mpf_sqrt_ui(constant, 10005);
     mpf_mul_ui(constant, constant, 426880);
 
-    unsigned long iters = prec_digits / 8;
+    // round up division
+    unsigned long iters = (prec_digits + 8 - 1) / 8;
     mpf_t sum;
     mpf_init(sum);
 
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for schedule(dynamic) shared(sum, last_M_q, last_M_num, last_M_den)
     for(unsigned long k = 0; k < iters; k++)
     {
-        mpz_t l, x, m;
-        mpz_inits(l, x, m, NULL);
+        mpz_t l, x, m, M_num, M_den;
+        mpz_inits(l, x, m, M_num, M_den, NULL);
+        // calculate iteration
         L(l, k);
         X(x, k);
-        M(m, k);
+        M(m, M_num, M_den, k);
 
+        // calculate numerator and denominator
         mpf_t n, d; 
         mpf_inits(n, d, NULL);
         mpz_mul(m, m, l); // reusing `m' to calculate numerator
@@ -160,7 +149,19 @@ void pi(mpf_t result, unsigned long prec_bits, unsigned long prec_digits)
             mpf_add(sum, sum, n);
         }
 
-        mpz_clears(l, x, m, NULL);
+        if ((k % M_change_interval) == 0 && k > last_M_q)
+        {
+            omp_set_lock(&rw_M);
+            // #pragma omp critical
+            // {
+                last_M_q = k;
+                mpz_set(last_M_num, M_num);
+                mpz_set(last_M_den, M_den);
+            // }
+            omp_unset_lock(&rw_M);
+        }
+
+        mpz_clears(l, x, m, M_num, M_den, NULL);
         mpf_clears(n, d, NULL);
     }
     #pragma omp barrier
@@ -168,6 +169,8 @@ void pi(mpf_t result, unsigned long prec_bits, unsigned long prec_digits)
     mpf_div(final, constant, sum);
     mpf_set(result, final);
     mpf_clears(constant, final, sum, NULL);
+    mpz_clears(last_M_num, last_M_den, NULL);
+    omp_destroy_lock(&rw_M);
     return;
 }
 
@@ -178,6 +181,7 @@ int main(int argc, char* argv[])
     mpf_set_default_prec(prec_bits);
     mpf_t r;
     mpf_init(r);
+    omp_init_lock(&rw_M);
 
     pi(r, prec_bits, prec_digits);
     gmp_printf("%.*Ff\n", prec_digits, r);
