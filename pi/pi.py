@@ -1,76 +1,98 @@
-from multiprocessing import Queue, Pool
-import sys
+# Pi Calculator using the Chudnovsky algorithm
+# binary_split function from Wikipedia (2023-11-28)
+#   link: https://en.wikipedia.org/wiki/Chudnovsky_algorithm
+# Required modules: mpmath, gmpy (optional)
+
 import mpmath
-from mpmath import mpf
+import logging
+import sys
+import os
+import multiprocessing
+import argparse
+from math import ceil
 
-pi_queue = Queue()
 
-def L(q: int) -> int:
-    return (545140134 * q) + 13591409
+def binary_split(args):
+    a, b = args
+    if b == a + 1:
+        Pab = -(6 * a - 5) * (2 * a - 1) * (6 * a - 1)
+        Qab = 10939058860032000 * a**3
+        Rab = Pab * (545140134 * a + 13591409)
+    else:
+        m = (a + b) // 2
+        Pam, Qam, Ram = binary_split((a, m))
+        Pmb, Qmb, Rmb = binary_split((m, b))
 
-def X(q: int) -> int:
-    return (-262537412640768000) ** q
-
-class MCalculate:
-    def __init__(self):
-        self.last_num = 1
-        self.last_den = 1
-        self.last_q = 0
+        Pab = Pam * Pmb
+        Qab = Qam * Qmb
+        Rab = Qmb * Ram + Pam * Rmb
+    return Pab, Qab, Rab
     
-    def __call__(self, q):
-        num = self.last_num
-        den = self.last_den
-        if q > self.last_q:
-            for i in range(self.last_q, q):
-                num *= (12*i + 6) ** 3 - (192*i + 96)
-                den *= (i + 1) ** 3
-            self.last_num = num
-            self.last_den = den
-        elif q < self.last_q:
-            for i in range(self.last_q - 1, q + 1, -1):
-                num /= (12*i + 6) ** 3 - (192*i + 96)
-                den /= (i + 1) ** 3
-        # don't have to write anything for q == self.last_q because return will be same
-        return num // den # avoid returning floats
 
-def range_chunks(start, end, n): # TODO: calculate extra numbers
-    # range [start, end)
-    # n: number of chunks
-    def custom_range(start, end, extra=None):
-        for i in range(start, end):
-            yield i
-        if extra is not None:
-            yield extra
+def binary_split_worker(args):
+    logging.debug(f'process {multiprocessing.current_process().name} started')
+    result = binary_split(args)
+    logging.debug(f'process {multiprocessing.current_process().name} finished')
+    return result
 
+
+def make_ranges(start, end, n):
+    # make n tuple ranges. each tuple's end is the next tuple's start
     interval = (end - start) // n
-    extras = iter(range(interval * n + 1, end + 1))
-    # print(extras)
-    for i in range(n):
-        start_num = start + (interval * i)
-        extra = None
-        try:
-            extra = next(extras)
-        except StopIteration:
-            pass
+    ranges = []
+    for i in range(0, n - 1):
+        ranges.append((i * interval + start, (i + 1) * interval + start))
 
-        yield iter(custom_range(start_num, start_num + interval, extra))
+    ranges.append(((n - 1) * interval + start, end))
+    logging.debug('ranges: ' + str(ranges))
+    return ranges
 
-def pi_calculator(r):
-    # r is is range to calculate
-    M = MCalculate()
-    pi_sum = 0
-    for i in r:
-        pi_sum += M(i) * mpf(L(i)) / X(i)
-    # pi_queue.put(pi_sum)
-    return pi_sum
+
+def chudnovsky(n, threads=1):
+    logging.debug(f'threads: {threads}')
+    
+    intervals = make_ranges(1, n + 1, threads)
+    with multiprocessing.Pool(threads) as p:
+        results = p.map(binary_split_worker, intervals)
+    
+    logging.debug('combining results')
+    while len(results) > 1:
+        a, b = results[0:2]
+        results = [(a[0] * b[0],
+                    a[1] * b[1], 
+                    b[1] * a[2] + a[0] * b[2])] + results[2:]
+
+    P1n, Q1n, R1n = results[0]
+
+    # assert (P1n, Q1n, R1n) == binary_split((1, n))
+    logging.debug('calculating final result')
+    return (426880 * mpmath.mpf(10005).sqrt() * Q1n) / (13591409 * Q1n + R1n)
+
 
 def main():
-    iters = 10
-    mpmath.mp.dps = iters * 8
-    constant = mpf(426880) * mpf(10005).sqrt()
-    # with Pool(processes=2) as pool:
-        # print(constant / sum(pool.map(pi_calculator, [*range_chunks(0, 10, 2)])))
-    print(constant / pi_calculator([*range_chunks(0, iters, 1)][0]))
+    logging.basicConfig(level=logging.DEBUG)
+    parser = argparse.ArgumentParser(
+                 prog=os.path.basename(__file__),
+                 description='Calculate Pi to n digits with multiprocessing')
+    parser.add_argument('precision', type=int, default=1)
+    parser.add_argument('-n', '--ncpu', type=int,
+                        default=multiprocessing.cpu_count())
+    parser.add_argument('-o', '--output', type=str, default='-')
+    args = parser.parse_args()
 
+    if args.precision > 14:
+        iters = ceil(args.precision / 14)
+    else:
+        iters = multiprocessing.cpu_count() * 2
+    mpmath.mp.dps = args.precision
+    logging.debug(f'iters: {iters}')
+
+    final_result = chudnovsky(iters, threads=args.ncpu)
+    if args.output == '-':
+        print(final_result)
+    else:
+        with open(args.output, 'w') as f:
+            f.write(str(final_result))
+    
 if __name__ == '__main__':
     main()
