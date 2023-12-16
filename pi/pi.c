@@ -1,190 +1,139 @@
-/* Pi calculator using the Chudnovsky algorithm
- * Written by: Kai-Yu She (June 2023)
- * Formulas from https://en.wikipedia.org/wiki/Chudnovsky_algorithm
- * To compile: gcc pi.c -o pi -fopenmp -lgmp
- * - Required to have GNU GMP installed on system
+/* Pi Calculator using the binary splitting method for the Chudnovsky Algorithm
+ * from https://en.wikipedia.org/wiki/Chudnovsky_algorithm
 */
 
+#include <omp.h>
+#include <gmp.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <gmp.h>
-#include <omp.h>
 
 #define BITS_PER_DIGIT 3.32192809489
-omp_lock_t rw_M;
 
-static inline void L(mpz_t result, unsigned long q)
+void binary_split(mpz_t r_Pab, mpz_t r_Qab, mpz_t r_Rab, long a, long b)
 {
-    // 545140134q + 13591409
-    mpz_set_ui(result, 545140134);
-    mpz_mul_ui(result, result, q);
-    mpz_add_ui(result, result, 13591409);
+    // P(a, a+1) = -(6a-1)(2a-1)(6a-5)
+    // Q(a, a+1) = 10939058860032000a**3
+    // R(a, a+1) = P(a, a+1) * (545140134a + 13591409)
+    mpz_t Pab, Qab, Rab;
+    mpz_inits(Pab, Qab, Rab, NULL);
+    // printf("binary split inside a=%ld b=%ld\n", a, b);
+    
+    if (b == a + 1)
+    {
+        // calculate P. initialize 3 variables for the terms
+        mpz_t P1, P2, P3;
+        
+        mpz_init_set_si(P1, a);
+        mpz_mul_ui(P1, P1, 6);
+        mpz_sub_ui(P1, P1, 1);
+        mpz_neg(P1, P1);
+        
+        mpz_init_set_si(P2, a);
+        mpz_mul_ui(P2, P2, 2);
+        mpz_sub_ui(P2, P2, 1);
+        
+        mpz_init_set_si(P3, a);
+        mpz_mul_ui(P3, P3, 6);
+        mpz_sub_ui(P3, P3, 5);
+        
+        //mpz_set(Pab, P1);
+        mpz_mul(Pab, P1, P2);
+        mpz_mul(Pab, Pab, P3);
+        
+        // calculate Q
+        mpz_set_si(Qab, a);
+        mpz_pow_ui(Qab, Qab, 3);
+        mpz_mul_ui(Qab, Qab, 10939058860032000);
+        
+        // calculate R
+        mpz_set_si(Rab, a);
+        mpz_mul_ui(Rab, Rab, 545140134);
+        mpz_add_ui(Rab, Rab, 13591409);
+        mpz_mul(Rab, Rab, Pab);
+        
+        mpz_clears(P1, P2, P3, NULL);
+    }
+    else
+    {
+        long m = (a + b) / 2;
+        mpz_t Pam, Qam, Ram, Pmb, Qmb, Rmb, Pam_Rmb;
+        mpz_inits(Pam, Qam, Ram, Pmb, Qmb, Rmb, Pam_Rmb, NULL);
+        
+        binary_split(Pam, Qam, Ram, a, m);
+        binary_split(Pmb, Qmb, Rmb, m, b);
+        
+        mpz_mul(Pab, Pam, Pmb);
+        mpz_mul(Qab, Qam, Qmb);
+        mpz_mul(Rab, Qmb, Ram);
+        // use Pam_Rmb to calculate second term Pam * Rmb
+        mpz_mul(Pam_Rmb, Pam, Rmb);
+        mpz_add(Rab, Rab, Pam_Rmb);
+        
+        mpz_clears(Pam, Qam, Ram, Pmb, Qmb, Rmb, Pam_Rmb, NULL);
+    }
+
+    mpz_set(r_Pab, Pab);
+    mpz_set(r_Qab, Qab);
+    mpz_set(r_Rab, Rab);
+    mpz_clears(Pab, Qab, Rab, NULL);
     return;
 }
 
-static inline void X(mpz_t result, unsigned long q)
+void chudnovsky(mpf_t r_pi, long n, int threads, unsigned long prec_bits)
 {
-    // (-262537412640768000)^q
-    mpz_set_ui(result, 262537412640768000);
-    mpz_pow_ui(result, result, q);
-    if (q % 2 != 0)
-    {
-        mpz_mul_si(result, result, -1);
-    }
-    return;
-}
+    // (426880 * sqrt(10005) * Q(1, n)) / (13591409 * Q(1, n) + R(1, n))
+    // to retain accuracy, denominator is initially an integer
+    mpf_set_default_prec(prec_bits);
 
-mpz_t last_M_num;
-mpz_t last_M_den;
-unsigned int last_M_q;
-void M(mpz_t rv, mpz_t n, mpz_t d, unsigned long q)
-{
-    // ((12q + 6)^3 - (192q + 96))/(q+1)^3
-    mpz_t a, b, c, result, num, den;
-    mpz_inits(a, b, c, result, num, den, NULL);
-    unsigned int last_q;
-
-    omp_set_lock(&rw_M);
-    last_q = last_M_q;
-    mpz_set(num, last_M_num);
-    mpz_set(den, last_M_den);
-    omp_unset_lock(&rw_M);
-
-    // Calculate M based on previous value of M
-    if (q > last_q)
-    {
-        for (unsigned long n = last_q; n < q; n++)
-        {
-            mpz_set_ui(a, n);
-            mpz_mul_ui(a, a, 12);
-            mpz_add_ui(a, a, 6);
-            mpz_pow_ui(a, a, 3);
-
-            mpz_set_ui(b, n);
-            mpz_mul_ui(b, b, 192);
-            mpz_add_ui(b, b, 96);
-
-            mpz_sub(a, a, b);
-            mpz_mul(num, num, a);
-
-            mpz_set_ui(c, n);
-            mpz_add_ui(c, c, 1);
-            mpz_pow_ui(c, c, 3);
-            mpz_mul(den, den, c);
-        }
-    }
-    else if (q < last_q)
-    {
-        for (unsigned long n = last_q - 1; n >= q; n--)
-        {
-            mpz_set_ui(a, n);
-            mpz_mul_ui(a, a, 12);
-            mpz_add_ui(a, a, 6);
-            mpz_pow_ui(a, a, 3);
-
-            mpz_set_ui(b, n);
-            mpz_mul_ui(b, b, 192);
-            mpz_add_ui(b, b, 96);
-
-            mpz_sub(a, a, b);
-            mpz_divexact(num, num, a);
-
-            mpz_set_ui(c, n);
-            mpz_add_ui(c, c, 1);
-            mpz_pow_ui(c, c, 3);
-            mpz_divexact(den, den, c);
-        }
-    }
-    mpz_divexact(result, num, den);
-
-    mpz_set(rv, result);
-    mpz_set(n, num);
-    mpz_set(d, den);
-    mpz_clears(a, b, c, result, num, den, NULL);
-    return;
-}
-
-void pi(mpf_t result, unsigned long prec_bits, unsigned long prec_digits)
-{
-    // intialisation for M function
-    last_M_q = 0;
-    mpz_inits(last_M_num, last_M_den, NULL);
-    mpz_set_ui(last_M_num, 1);
-    mpz_set_ui(last_M_den, 1);
-    int M_change_interval = 10; // for last_M_* variables
-
-    // omp_init_lock(&rw_M);
-
-    // constant
-    mpf_t constant, final;
-    mpf_inits(constant, final, NULL);
-    mpf_sqrt_ui(constant, 10005);
-    mpf_mul_ui(constant, constant, 426880);
-
-    // round up division
-    unsigned long iters = (prec_digits + 8 - 1) / 8;
-    mpf_t sum;
-    mpf_init(sum);
-
-    #pragma omp parallel for schedule(dynamic) shared(sum, last_M_q, last_M_num, last_M_den)
-    for(unsigned long k = 0; k < iters; k++)
-    {
-        mpz_t l, x, m, M_num, M_den;
-        mpz_inits(l, x, m, M_num, M_den, NULL);
-        // calculate iteration
-        L(l, k);
-        X(x, k);
-        M(m, M_num, M_den, k);
-
-        // calculate numerator and denominator
-        mpf_t n, d; 
-        mpf_inits(n, d, NULL);
-        mpz_mul(m, m, l); // reusing `m' to calculate numerator
-        mpf_set_z(n, m);
-        mpf_set_z(d, x);
-        mpf_div(n, n, d);
-
-       #pragma omp critical
-        {
-            mpf_add(sum, sum, n);
-        }
-
-        if ((k % M_change_interval) == 0 && k > last_M_q)
-        {
-            omp_set_lock(&rw_M);
-            // #pragma omp critical
-            // {
-                last_M_q = k;
-                mpz_set(last_M_num, M_num);
-                mpz_set(last_M_den, M_den);
-            // }
-            omp_unset_lock(&rw_M);
-        }
-
-        mpz_clears(l, x, m, M_num, M_den, NULL);
-        mpf_clears(n, d, NULL);
-    }
-    #pragma omp barrier
-
-    mpf_div(final, constant, sum);
-    mpf_set(result, final);
-    mpf_clears(constant, final, sum, NULL);
-    mpz_clears(last_M_num, last_M_den, NULL);
-    omp_destroy_lock(&rw_M);
+    mpz_t int_den;
+    mpz_init(int_den);
+    mpf_t den, f_Qab;
+    mpf_inits(den, f_Qab, NULL);
+    
+    mpz_t Pab, Qab, Rab;
+    mpz_inits(Pab, Qab, Rab, NULL);
+    printf("binary split\n");
+    binary_split(Pab, Qab, Rab, 1, n + 1);
+    mpf_set_z(f_Qab, Qab);
+    
+    printf("calculating numerator\n");
+    mpf_set_d(r_pi, 10005.0);
+    mpf_sqrt(r_pi, r_pi);
+    mpf_mul_ui(r_pi, r_pi, 426880);
+    mpf_mul(r_pi, r_pi, f_Qab);
+    
+    printf("calculating denominator\n");
+    mpz_mul_ui(int_den, Qab, 13591409);
+    mpz_add(int_den, int_den, Rab);
+    mpf_set_z(den, int_den);
+    
+    mpf_div(r_pi, r_pi, den);
+    mpz_clears(int_den, Pab, Qab, Rab, NULL);
+    mpf_clears(den, f_Qab, NULL);
     return;
 }
 
 int main(int argc, char* argv[])
 {
-    unsigned long prec_digits = atoi(argv[1]);
-    unsigned long prec_bits = (prec_digits + 1) * BITS_PER_DIGIT + 3;
+    printf("getting prec\n");
+    unsigned long prec = atol(argv[1]);
+    unsigned long prec_bits = (prec + 2) * BITS_PER_DIGIT + 3;
+    printf("prec: %ld\n", prec);
+    printf("prec_bits: %ld\n", prec_bits);
     mpf_set_default_prec(prec_bits);
-    mpf_t r;
-    mpf_init(r);
-    omp_init_lock(&rw_M);
-
-    pi(r, prec_bits, prec_digits);
-    gmp_printf("%.*Ff\n", prec_digits, r);
-    mpf_clear(r);
+    mpf_t pi;
+    mpf_init(pi);
+    int n;
+    if (prec / 14 > 1)
+    {
+        n = prec / 14 + 1;
+    }
+    else
+    {
+        n = 2;
+    }
+    chudnovsky(pi, prec / 14 + 1, 1, prec_bits);
+    gmp_printf("%.*Ff\n", prec, pi);
+    
     return 0;
 }
