@@ -4,8 +4,8 @@
 
 #include <omp.h>
 #include <gmp.h>
-#include <stdio.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #define BITS_PER_DIGIT 3.32192809489
 
@@ -85,16 +85,58 @@ void chudnovsky(mpf_t r_pi, long n, int threads, unsigned long prec_bits)
     // to retain accuracy, denominator is initially an integer
     mpf_set_default_prec(prec_bits);
 
+    mpz_t P[threads];
+    mpz_t Q[threads];
+    mpz_t R[threads];
+    for (int i = 0; i < threads; i++)
+    {
+        mpz_inits(P[i], Q[i], R[i], NULL);
+    }
+
     mpz_t int_den;
     mpz_init(int_den);
     mpf_t den, f_Qab;
     mpf_inits(den, f_Qab, NULL);
     
-    mpz_t Pab, Qab, Rab;
-    mpz_inits(Pab, Qab, Rab, NULL);
-    printf("binary split\n");
-    binary_split(Pab, Qab, Rab, 1, n + 1);
-    mpf_set_z(f_Qab, Qab);
+    // multiprocessing implementation
+    long interval = n / threads;
+    printf("n %ld\nthreads %d\n", n, threads);
+    printf("interval %ld\n", interval);
+    
+    #pragma omp parallel for num_threads(threads)
+    for (int i = 0; i < threads - 1; i++)
+    {
+        long start = i * interval + 1;
+        long end = (i + 1) * interval + 1;
+        // printf("%ld %ld\n", start, end);
+        binary_split(P[i], Q[i], R[i], start, end);
+    }
+    // printf("%ld %ld\n", (threads - 1) * interval + 1, n);
+    binary_split(P[threads - 1], Q[threads - 1], R[threads - 1], (threads - 1) * interval + 1, n);
+    #pragma omp barrier
+    
+    if (threads > 1)
+    {
+        for (int i = 1; i < threads; i++)
+        {
+            // printf("i %d\n", i);
+            mpz_t temp_P, temp_Q, temp_R, P_R;
+            mpz_inits(temp_P, temp_Q, temp_R, P_R, NULL);
+            mpz_mul(temp_P, P[0], P[i]);
+            mpz_mul(temp_Q, Q[0], Q[i]);
+            mpz_mul(temp_R, Q[i], R[0]);
+            mpz_mul(P_R, P[0], R[i]);
+            mpz_add(temp_R, temp_R, P_R);
+
+            mpz_set(P[0], temp_P);
+            mpz_set(Q[0], temp_Q);
+            mpz_set(R[0], temp_R);
+            mpz_clears(P[i], Q[i], R[i], NULL);
+            mpz_clears(temp_P, temp_Q, temp_R, NULL);
+        }
+    }
+
+    mpf_set_z(f_Qab, Q[0]);
     
     printf("calculating numerator\n");
     mpf_set_d(r_pi, 10005.0);
@@ -103,12 +145,13 @@ void chudnovsky(mpf_t r_pi, long n, int threads, unsigned long prec_bits)
     mpf_mul(r_pi, r_pi, f_Qab);
     
     printf("calculating denominator\n");
-    mpz_mul_ui(int_den, Qab, 13591409);
-    mpz_add(int_den, int_den, Rab);
+    mpz_mul_ui(int_den, Q[0], 13591409);
+    mpz_add(int_den, int_den, R[0]);
     mpf_set_z(den, int_den);
     
     mpf_div(r_pi, r_pi, den);
-    mpz_clears(int_den, Pab, Qab, Rab, NULL);
+
+    mpz_clears(P[0], Q[0], R[0], NULL);
     mpf_clears(den, f_Qab, NULL);
     return;
 }
@@ -117,22 +160,20 @@ int main(int argc, char* argv[])
 {
     printf("getting prec\n");
     unsigned long prec = atol(argv[1]);
+    // unsigned long prec = 200;
     unsigned long prec_bits = (prec + 2) * BITS_PER_DIGIT + 3;
     printf("prec: %ld\n", prec);
     printf("prec_bits: %ld\n", prec_bits);
     mpf_set_default_prec(prec_bits);
     mpf_t pi;
     mpf_init(pi);
-    int n;
-    if (prec / 14 > 1)
+    int threads = omp_get_max_threads();
+    int n = (prec / 14 > 1) ? prec / 14 + 1 : 2;
+    if (n < threads)
     {
-        n = prec / 14 + 1;
+        threads = n / 2;
     }
-    else
-    {
-        n = 2;
-    }
-    chudnovsky(pi, prec / 14 + 1, 1, prec_bits);
+    chudnovsky(pi, n, threads, prec_bits);
     gmp_printf("%.*Ff\n", prec, pi);
     
     return 0;
