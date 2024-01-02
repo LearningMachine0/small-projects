@@ -115,25 +115,48 @@ void chudnovsky(mpf_t r_pi, long n, int threads, unsigned long prec_bits)
     binary_split(P[threads - 1], Q[threads - 1], R[threads - 1], (threads - 1) * interval + 1, n);
     #pragma omp barrier
     
-    if (threads > 1)
+    // multithreaded combination
+    int curr_length = threads; // current length of the result arrays
+    while (curr_length > 1)
     {
-        for (int i = 1; i < threads; i++)
+        // combine results in pairs. This can be done in parallel
+        #pragma omp parallel for num_threads(curr_length/2)
+        for (int i = 0; i < curr_length; i += 2)
         {
-            // printf("i %d\n", i);
-            mpz_t temp_P, temp_Q, temp_R, P_R;
-            mpz_inits(temp_P, temp_Q, temp_R, P_R, NULL);
-            mpz_mul(temp_P, P[0], P[i]);
-            mpz_mul(temp_Q, Q[0], Q[i]);
-            mpz_mul(temp_R, Q[i], R[0]);
-            mpz_mul(P_R, P[0], R[i]);
-            mpz_add(temp_R, temp_R, P_R);
-
-            mpz_set(P[0], temp_P);
-            mpz_set(Q[0], temp_Q);
-            mpz_set(R[0], temp_R);
-            mpz_clears(P[i], Q[i], R[i], NULL);
-            mpz_clears(temp_P, temp_Q, temp_R, NULL);
+            // calculate R first before P and Q are modified
+            // eliminates the need for temp variables -> less memory used
+            mpz_t P_R; // for calculating second term of R
+            mpz_init(P_R);
+            mpz_mul(P_R, P[i], R[i+1]);
+            mpz_mul(R[i], Q[i+1], R[i]);
+            mpz_add(R[i], R[i], P_R);
+            mpz_clear(P_R);
+            mpz_mul(P[i], P[i], P[i+1]);
+            mpz_mul(Q[i], Q[i], Q[i+1]);
         }
+        #pragma omp barrier
+        // move calculated values to first half of the array
+        // also move last value if curr_length is odd
+        for (int i = 0; i < (curr_length / 2); i++)
+        {
+            mpz_set(P[i], P[i*2]);
+            mpz_set(Q[i], Q[i*2]);
+            mpz_set(R[i], R[i*2]);
+        }
+        if (curr_length % 2 == 1)
+        {
+            mpz_set(P[curr_length/2], P[curr_length-1]);
+            mpz_set(Q[curr_length/2], Q[curr_length-1]);
+            mpz_set(R[curr_length/2], R[curr_length-1]);
+        }
+        // clear previous second half
+        // the initial i value is the next curr_length value
+        for (int i = (int)((double)curr_length / 2 + 0.5); i < curr_length; i++)
+        {
+            mpz_clears(P[i], Q[i], R[i], NULL);
+        }
+        // set curr_length to half of previous length, rounded to account for odd length
+        curr_length = (int)((double)curr_length / 2 + 0.5);
     }
 
     mpf_set_z(f_Qab, Q[0]);
