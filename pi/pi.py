@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Pi Calculator using the Chudnovsky algorithm
 # binary_split function from Wikipedia (2023-11-28)
 #   link: https://en.wikipedia.org/wiki/Chudnovsky_algorithm
